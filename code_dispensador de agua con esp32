@@ -1,0 +1,266 @@
+#include <Preferences.h>
+
+// Sensores y actuadores principales
+#define COIN_PIN      14
+#define FLOW_PIN      27
+#define START_BTN     33
+#define PAUSE_BTN     32
+#define BOMBA_DIS     19
+#define BLOCK_COIN    12
+
+// Sensores de nivel y llenado
+#define SEN_NIV_INF   34
+#define SEN_NIV_SUP   39
+#define SEN_ING_AGUA  35
+#define BOMBA_ING     17
+
+// LEDs
+#define LED_ROJO      25
+#define LED_VERDE     13
+#define LED_AMBAR     26
+
+// Botones config
+#define OK_BTN        2
+#define ADD_BTN       4
+#define MINUS_BTN     15
+
+Preferences preferences;
+
+// Estados
+enum State {
+  IDLE,
+  DISPENSING,
+  PAUSED,
+  CONFIG
+};
+State state = IDLE;
+
+// ISR
+volatile int coinPulseCount = 0;
+volatile int flowPulseCount = 0;
+volatile unsigned long lastCoinPulseTime = 0;
+
+// Variables
+float saldo = 0.0;
+unsigned long totalFlowPulses = 0;
+float litrosObjetivo = 0.0;
+
+// Pausa
+unsigned long pausaStartTime = 0;
+const unsigned long PAUSE_DURATION = 30000;
+int tiempoRestantePausa = 30;
+
+// Config
+unsigned long PULSOS_POR_LITRO = 439;
+
+struct Config {
+  int precio1Cent;
+  int precio7Cent;
+  int precio20Cent;
+  int pulsos;
+  long totalRecaudado;
+} config;
+
+int configStep = 0;
+long configEditValue = 0;
+
+// Tanque
+bool hayAguaEnTanque = false;
+bool hayAguaEntrada = false;
+bool fillingActive = false;
+
+// ----------- SERIAL PRINT -----------
+
+void mostrarEstado() {
+  Serial.println("----- ESTADO -----");
+
+  Serial.print("Estado: ");
+  if (state == IDLE) Serial.println("IDLE");
+  if (state == DISPENSING) Serial.println("DISPENSANDO");
+  if (state == PAUSED) Serial.println("PAUSA");
+  if (state == CONFIG) Serial.println("CONFIG");
+
+  Serial.print("Saldo: "); Serial.println(saldo);
+  Serial.print("Litros: ");
+  Serial.println((float)totalFlowPulses / PULSOS_POR_LITRO);
+
+  if (!hayAguaEnTanque) {
+    Serial.println("⚠ SIN AGUA");
+  }
+
+  if (state == PAUSED) {
+    Serial.print("Tiempo restante pausa: ");
+    Serial.println(tiempoRestantePausa);
+  }
+
+  Serial.println("------------------\n");
+}
+
+void mostrarConfig() {
+  Serial.println("---- CONFIG ----");
+
+  switch (configStep) {
+    case 0: Serial.println("Precio 1L"); break;
+    case 1: Serial.println("Precio 7L"); break;
+    case 2: Serial.println("Precio 20L"); break;
+    case 3: Serial.println("Pulsos/Litro"); break;
+    case 4: Serial.println("Total Recaudado"); break;
+  }
+
+  Serial.print("Valor: ");
+  Serial.println(configEditValue);
+
+  Serial.println("----------------\n");
+}
+
+// ----------- SETUP -----------
+
+void setup() {
+  Serial.begin(115200);
+
+  pinMode(COIN_PIN, INPUT_PULLDOWN);
+  pinMode(FLOW_PIN, INPUT_PULLDOWN);
+  pinMode(START_BTN, INPUT_PULLDOWN);
+  pinMode(PAUSE_BTN, INPUT_PULLDOWN);
+
+  pinMode(BOMBA_DIS, OUTPUT);
+  pinMode(BLOCK_COIN, OUTPUT);
+  pinMode(BOMBA_ING, OUTPUT);
+
+  pinMode(LED_ROJO, OUTPUT);
+  pinMode(LED_VERDE, OUTPUT);
+  pinMode(LED_AMBAR, OUTPUT);
+
+  attachInterrupt(digitalPinToInterrupt(COIN_PIN), coinISR, RISING);
+  attachInterrupt(digitalPinToInterrupt(FLOW_PIN), flowISR, RISING);
+
+  cargarConfiguracion();
+
+  Serial.println("Sistema iniciado");
+  mostrarEstado();
+}
+
+// ----------- LOOP -----------
+
+void loop() {
+  controlTanqueYLeds();
+
+  if (state == CONFIG) {
+    manejarConfiguracion();
+    return;
+  }
+
+  if (state == IDLE && coinPulseCount > 0) {
+    noInterrupts();
+    int pulses = coinPulseCount;
+    coinPulseCount = 0;
+    interrupts();
+
+    saldo += pulses;
+    mostrarEstado();
+  }
+
+  if (state == DISPENSING && flowPulseCount > 0) {
+    noInterrupts();
+    int pulses = flowPulseCount;
+    flowPulseCount = 0;
+    interrupts();
+
+    totalFlowPulses += pulses;
+
+    float litrosActual = (float)totalFlowPulses / PULSOS_POR_LITRO;
+
+    Serial.print("Litros actuales: ");
+    Serial.println(litrosActual);
+
+    if (litrosActual >= litrosObjetivo) {
+      finalizarDispensado();
+    }
+  }
+}
+
+// ----------- FUNCIONES -----------
+
+void coinISR() {
+  coinPulseCount++;
+  lastCoinPulseTime = millis();
+}
+
+void flowISR() {
+  flowPulseCount++;
+}
+
+void iniciarDispensado() {
+  litrosObjetivo = saldo;
+  totalFlowPulses = 0;
+
+  digitalWrite(BOMBA_DIS, HIGH);
+  state = DISPENSING;
+
+  Serial.println(">>> INICIANDO DISPENSADO");
+}
+
+void finalizarDispensado() {
+  digitalWrite(BOMBA_DIS, LOW);
+
+  saldo = 0;
+  totalFlowPulses = 0;
+
+  state = IDLE;
+
+  Serial.println(">>> DISPENSADO FINALIZADO");
+  mostrarEstado();
+}
+
+void controlTanqueYLeds() {
+  hayAguaEnTanque = digitalRead(SEN_NIV_INF) == LOW;
+
+  if (!hayAguaEnTanque) {
+    digitalWrite(LED_ROJO, HIGH);
+  } else {
+    digitalWrite(LED_ROJO, LOW);
+  }
+}
+
+// ----------- CONFIG -----------
+
+void cargarConfiguracion() {
+  preferences.begin("dispenser", false);
+
+  config.precio1Cent = preferences.getInt("precio1", 100);
+  config.precio7Cent = preferences.getInt("precio7", 300);
+  config.precio20Cent = preferences.getInt("precio20", 800);
+  config.pulsos = preferences.getInt("pulsos", 439);
+  config.totalRecaudado = preferences.getLong("totalRec", 0);
+
+  preferences.end();
+
+  PULSOS_POR_LITRO = config.pulsos;
+}
+
+void manejarConfiguracion() {
+  if (digitalRead(ADD_BTN)) {
+    configEditValue++;
+    mostrarConfig();
+    delay(200);
+  }
+
+  if (digitalRead(MINUS_BTN)) {
+    configEditValue--;
+    mostrarConfig();
+    delay(200);
+  }
+
+  if (digitalRead(OK_BTN)) {
+    configStep++;
+
+    if (configStep > 4) {
+      state = IDLE;
+      Serial.println("Saliendo de config");
+      return;
+    }
+
+    mostrarConfig();
+    delay(300);
+  }
+}
